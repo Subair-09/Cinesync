@@ -1,0 +1,5 @@
+{
+  "name": "CineSync",
+  "description": "Real-time co-watching and screen sharing app for long-distance partners.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"]
+}
