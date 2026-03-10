@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Peer, DataConnection, MediaConnection } from 'peerjs';
 import { 
   Tv, 
   Share2, 
@@ -56,13 +57,21 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 // --- App Component ---
 
 export default function App() {
-  const [roomId, setRoomId] = useState<string | null>(null);
+  const [roomId, setRoomId] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('room') || Math.random().toString(36).substring(7);
+  });
+  const [isHost] = useState(() => !new URLSearchParams(window.location.search).has('room'));
   const [userId] = useState(() => Math.random().toString(36).substring(7));
   const [userName, setUserName] = useState('');
   const [isJoined, setIsJoined] = useState(false);
@@ -80,9 +89,12 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [peerStatus, setPeerStatus] = useState<'connecting' | 'open' | 'error'>('connecting');
 
-  const socketRef = useRef<WebSocket | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const peerRef = useRef<Peer | null>(null);
+  const connectionsRef = useRef<Map<string, DataConnection>>(new Map());
+  const mediaConnectionsRef = useRef<Map<string, MediaConnection>>(new Map());
+  const localStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -103,161 +115,111 @@ export default function App() {
     userNameRef.current = userName;
   }, [userName]);
 
-  const safeSend = useCallback((data: any) => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify(data));
-    } else {
-      console.warn("WebSocket is not open. State:", socketRef.current?.readyState);
+  useEffect(() => {
+    if (localStream) {
+      localStreamRef.current = localStream;
     }
-  }, []);
+  }, [localStream]);
 
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
-    socketRef.current = socket;
+    if (!isJoined) return;
 
-    socket.onmessage = async (event) => {
-      const data: Message = JSON.parse(event.data);
-
-      switch (data.type) {
-        case 'user-joined':
-          setMessages(prev => [...prev, {
-            text: `A partner joined the room!`,
-            sender: 'System',
-            timestamp: new Date().toLocaleTimeString(),
-            isMe: false
-          }]);
-          // If we are sharing, we should initiate a connection to the new user
-          if (isSharingRef.current) {
-            initiatePeerConnection();
-          }
-          break;
-
-        case 'signal':
-          if (data.signal.type === 'offer') {
-            await handleOffer(data.signal, data.from!);
-          } else if (data.signal.type === 'answer') {
-            await handleAnswer(data.signal);
-          } else if (data.signal.candidate) {
-            await handleCandidate(data.signal.candidate);
-          }
-          break;
-
-        case 'chat':
-          setMessages(prev => [...prev, {
-            text: data.text!,
-            sender: data.sender!,
-            timestamp: new Date(data.timestamp!).toLocaleTimeString(),
-            isMe: data.sender === userNameRef.current
-          }]);
-          break;
-      }
-    };
-
-    return () => {
-      socket.close();
-    };
-  }, []); // Empty dependency array to prevent constant reconnections
-
-  // --- WebRTC Logic ---
-
-  const initiatePeerConnection = async (streamToShare?: MediaStream) => {
-    const stream = streamToShare || localStream;
-    if (!stream) return;
-
-    // Close existing connection if any
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-    }
-    pendingCandidates.current = [];
-
-    const pc = createPeerConnection();
-    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    safeSend({
-      type: 'signal',
-      signal: offer,
-      from: userId
+    const myPeerId = isHost ? roomId : userId;
+    const peer = new Peer(myPeerId, {
+      config: ICE_SERVERS,
+      debug: 1
     });
-  };
+    peerRef.current = peer;
 
-  const createPeerConnection = () => {
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-    peerConnectionRef.current = pc;
+    peer.on('open', (id) => {
+      console.log('My peer ID is: ' + id);
+      setPeerStatus('open');
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        safeSend({
-          type: 'signal',
-          signal: { candidate: event.candidate },
-          from: userId
+      // If we are a guest, connect to the host
+      if (!isHost) {
+        const conn = peer.connect(roomId);
+        setupDataConnection(conn);
+        
+        conn.on('open', () => {
+          conn.send({
+            type: 'user-joined',
+            userName,
+            userId
+          });
         });
       }
-    };
+    });
 
-    pc.ontrack = (event) => {
-      setRemoteStream(event.streams[0]);
-    };
-
-    return pc;
-  };
-
-  const handleOffer = async (offer: RTCSessionDescriptionInit, from: string) => {
-    // Close existing connection if any
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
-    }
-    pendingCandidates.current = [];
-    
-    const pc = createPeerConnection();
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    
-    // Process buffered candidates
-    while (pendingCandidates.current.length > 0) {
-      const candidate = pendingCandidates.current.shift();
-      if (candidate) {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    peer.on('error', (err) => {
+      console.error('PeerJS error:', err);
+      setPeerStatus('error');
+      if (err.type === 'peer-unavailable') {
+        // This is expected if we are the first one in the room
+      } else {
+        setErrorMessage(`Connection error: ${err.type}`);
       }
-    }
-    
-    // If we have a local stream (e.g. we are also sharing), add it
-    if (localStream) {
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-    }
+    });
 
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    // Handle incoming data connections (chat)
+    peer.on('connection', (conn) => {
+      setupDataConnection(conn);
+    });
 
-    safeSend({
-      type: 'signal',
-      signal: answer,
-      from: userId
+    // Handle incoming media connections (screen share)
+    peer.on('call', (call) => {
+      call.answer(); // Answer the call
+      call.on('stream', (remoteStream) => {
+        setRemoteStream(remoteStream);
+      });
+      mediaConnectionsRef.current.set(call.peer, call);
+    });
+
+    return () => {
+      peer.destroy();
+    };
+  }, [userId]);
+
+  const setupDataConnection = (conn: DataConnection) => {
+    conn.on('open', () => {
+      connectionsRef.current.set(conn.peer, conn);
+    });
+
+    conn.on('data', (data: any) => {
+      if (data.type === 'chat') {
+        setMessages(prev => [...prev, {
+          text: data.text,
+          sender: data.sender,
+          timestamp: new Date(data.timestamp).toLocaleTimeString(),
+          isMe: false
+        }]);
+      } else if (data.type === 'user-joined') {
+        setMessages(prev => [...prev, {
+          text: `${data.userName} joined the room!`,
+          sender: 'System',
+          timestamp: new Date().toLocaleTimeString(),
+          isMe: false
+        }]);
+        // If we are sharing, we should call them
+        if (isSharingRef.current && localStreamRef.current) {
+          const call = peerRef.current!.call(conn.peer, localStreamRef.current);
+          mediaConnectionsRef.current.set(conn.peer, call);
+        }
+      }
+    });
+
+    conn.on('close', () => {
+      connectionsRef.current.delete(conn.peer);
+      mediaConnectionsRef.current.delete(conn.peer);
     });
   };
 
-  const handleAnswer = async (answer: RTCSessionDescriptionInit) => {
-    if (!peerConnectionRef.current) return;
-    await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
-    
-    // Process buffered candidates
-    while (pendingCandidates.current.length > 0) {
-      const candidate = pendingCandidates.current.shift();
-      if (candidate) {
-        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+  const broadcast = useCallback((data: any) => {
+    connectionsRef.current.forEach(conn => {
+      if (conn.open) {
+        conn.send(data);
       }
-    }
-  };
-
-  const handleCandidate = async (candidate: RTCIceCandidateInit) => {
-    if (peerConnectionRef.current && peerConnectionRef.current.remoteDescription) {
-      await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-    } else {
-      pendingCandidates.current.push(candidate);
-    }
-  };
+    });
+  }, []);
 
   // --- Actions ---
 
@@ -265,16 +227,14 @@ export default function App() {
     e.preventDefault();
     if (!userName || !roomId) return;
 
-    safeSend({
-      type: 'join',
-      roomId,
-      userId,
-      userName
-    });
     setIsJoined(true);
   };
 
   const startScreenShare = async () => {
+    if (peerStatus !== 'open') {
+      setErrorMessage("Not connected to the signaling service. Please wait.");
+      return;
+    }
     setErrorMessage(null);
     try {
       let stream;
@@ -298,8 +258,11 @@ export default function App() {
         localVideoRef.current.srcObject = stream;
       }
 
-      // Pass the stream directly to avoid waiting for state update
-      initiatePeerConnection(stream);
+      // Call all connected peers
+      connectionsRef.current.forEach((conn, peerId) => {
+        const call = peerRef.current!.call(peerId, stream);
+        mediaConnectionsRef.current.set(peerId, call);
+      });
 
       stream.getVideoTracks()[0].onended = () => {
         stopScreenShare();
@@ -307,12 +270,10 @@ export default function App() {
     } catch (err: any) {
       console.error("Error sharing screen:", err);
       if (err.name === 'NotAllowedError') {
-        setErrorMessage("Screen sharing permission was denied. Please click 'Start Screen Share' again and allow the browser to share your screen.");
+        setErrorMessage("Screen sharing permission was denied.");
       } else {
-        setErrorMessage("An error occurred while trying to share your screen. Please try again.");
+        setErrorMessage("An error occurred while trying to share your screen.");
       }
-      
-      // Auto-clear error after 5 seconds
       setTimeout(() => setErrorMessage(null), 5000);
     }
   };
@@ -321,18 +282,19 @@ export default function App() {
     localStream?.getTracks().forEach(track => track.stop());
     setLocalStream(null);
     setIsSharing(false);
-    peerConnectionRef.current?.close();
-    peerConnectionRef.current = null;
+    mediaConnectionsRef.current.forEach(call => call.close());
+    mediaConnectionsRef.current.clear();
   };
 
   const sendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim()) return;
 
-    safeSend({
+    broadcast({
       type: 'chat',
       text: inputText,
-      sender: userName
+      sender: userName,
+      timestamp: new Date().toISOString()
     });
 
     setMessages(prev => [...prev, {
@@ -352,12 +314,6 @@ export default function App() {
   };
 
   // --- Effects ---
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const rId = params.get('room');
-    if (rId) setRoomId(rId);
-  }, []);
 
   useEffect(() => {
     if (remoteStream && remoteVideoRef.current) {
@@ -523,6 +479,13 @@ export default function App() {
           <div className="flex items-center gap-2 text-white/40 text-xs font-medium uppercase tracking-widest">
             <Users className="w-3 h-3" />
             <span>Room: {roomId}</span>
+          </div>
+          <div className="h-4 w-[1px] bg-white/10 mx-2" />
+          <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest">
+            <div className={`w-2 h-2 rounded-full ${peerStatus === 'open' ? 'bg-green-500' : peerStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' : 'bg-red-500'}`} />
+            <span className={peerStatus === 'open' ? 'text-white/40' : 'text-red-400'}>
+              {peerStatus === 'open' ? 'Service Ready' : peerStatus === 'connecting' ? 'Connecting Service...' : 'Service Error'}
+            </span>
           </div>
         </div>
 
@@ -784,11 +747,19 @@ export default function App() {
                 <button 
                   onClick={() => {
                     if (scheduledTime) {
-                      safeSend({
+                      const text = `📅 Movie night scheduled for: ${new Date(scheduledTime).toLocaleString()}`;
+                      broadcast({
                         type: 'chat',
-                        text: `📅 Movie night scheduled for: ${new Date(scheduledTime).toLocaleString()}`,
-                        sender: 'System'
+                        text,
+                        sender: 'System',
+                        timestamp: new Date().toISOString()
                       });
+                      setMessages(prev => [...prev, {
+                        text,
+                        sender: 'System',
+                        timestamp: new Date().toLocaleTimeString(),
+                        isMe: true
+                      }]);
                       setShowScheduler(false);
                     }
                   }}
